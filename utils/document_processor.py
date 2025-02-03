@@ -1,54 +1,78 @@
 import logging
-from docx import Document
+import zipfile
+import xml.etree.ElementTree as ET
 from app import db, bedrock
 from models import TranslationJob
 import json
 import os
+import shutil
+from utils.bedrock_translator import BedrockTranslator
 
 logger = logging.getLogger(__name__)
 
 def process_document(job_id):
-    """Process and translate a document"""
+    """Process and translate a document by directly manipulating the word/document.xml content"""
     job = TranslationJob.query.get(job_id)
     if not job:
         logger.error(f"Job {job_id} not found")
         return
 
+    translator = BedrockTranslator()
     try:
         job.status = 'processing'
         db.session.commit()
 
-        # Load document
-        doc = Document(job.file_path)
-        total_paragraphs = len(doc.paragraphs)
-        translated_paragraphs = []
+        # Create a temporary directory for working with the ZIP contents
+        temp_dir = f"temp/job_{job_id}"
+        os.makedirs(temp_dir, exist_ok=True)
 
-        for i, paragraph in enumerate(doc.paragraphs):
-            if not paragraph.text.strip():
-                translated_paragraphs.append(paragraph.text)
-                continue
+        # Copy the original file to work with
+        temp_docx = os.path.join(temp_dir, "temp.docx")
+        shutil.copy2(job.file_path, temp_docx)
 
-            # Translate text using Bedrock
-            translated_text = translate_text(
-                paragraph.text,
-                job.source_language,
-                job.target_language
-            )
-            translated_paragraphs.append(translated_text)
+        with zipfile.ZipFile(temp_docx, 'r') as doc_zip:
+            # Read the main document XML
+            xml_content = doc_zip.read('word/document.xml')
+            tree = ET.fromstring(xml_content)
 
-            # Update progress
-            progress = (i + 1) / total_paragraphs * 100
-            job.progress = progress
-            db.session.commit()
+            # Find all text elements in the document
+            # Namespace for Word XML
+            ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+            text_elements = tree.findall('.//w:t', ns)
+            total_elements = len(text_elements)
 
-        # Create new document with translations
-        new_doc = Document()
-        for text in translated_paragraphs:
-            new_doc.add_paragraph(text)
+            # Process each text element
+            for i, elem in enumerate(text_elements):
+                if elem.text and elem.text.strip():
+                    # Translate the text
+                    translated_text = translator.translate_text(
+                        elem.text,
+                        job.source_language,
+                        job.target_language
+                    )
+                    elem.text = translated_text
 
-        # Save translated document
-        translated_path = f"temp/translated_{job.original_filename}"
-        new_doc.save(translated_path)
+                    # Update progress
+                    progress = (i + 1) / total_elements * 100
+                    job.progress = progress
+                    db.session.commit()
+
+            # Create a new ZIP file with the translated content
+            translated_path = f"temp/translated_{job.original_filename}"
+            with zipfile.ZipFile(temp_docx, 'r') as src_zip:
+                with zipfile.ZipFile(translated_path, 'w') as dest_zip:
+                    # Copy all files from original ZIP
+                    for item in src_zip.filelist:
+                        if item.filename != 'word/document.xml':
+                            # Copy original file
+                            dest_zip.writestr(item.filename, src_zip.read(item.filename))
+                        else:
+                            # Write the modified XML content
+                            dest_zip.writestr('word/document.xml', 
+                                           ET.tostring(tree, encoding='UTF-8', 
+                                                     xml_declaration=True))
+
+        # Update job with translated file path
         job.translated_file_path = translated_path
         job.status = 'completed'
         job.message = 'Translation completed successfully'
@@ -59,27 +83,6 @@ def process_document(job_id):
         job.message = f'Translation failed: {str(e)}'
 
     finally:
+        # Clean up temporary directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
         db.session.commit()
-
-def translate_text(text, source_lang, target_lang):
-    """Translate text using AWS Bedrock"""
-    prompt = f"""Translate the following text from {source_lang} to {target_lang}:
-    "{text}"
-    Translation:"""
-
-    try:
-        response = bedrock.invoke_model(
-            modelId="anthropic.claude-3-sonnet-20240229-v1:0",
-            body=json.dumps({
-                "prompt": prompt,
-                "max_tokens": 4096,
-                "temperature": 0.1
-            })
-        )
-        
-        response_body = json.loads(response['body'].read())
-        return response_body['completion'].strip()
-
-    except Exception as e:
-        logger.error(f"Translation error: {str(e)}")
-        raise
